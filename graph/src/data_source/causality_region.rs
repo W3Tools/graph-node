@@ -8,6 +8,8 @@ use diesel::{
 use std::fmt;
 use std::io;
 
+use crate::components::subgraph::Entity;
+
 /// The causality region of a data source. All onchain data sources share the same causality region,
 /// but each offchain data source is assigned its own. This isolates offchain data sources from
 /// onchain and from each other.
@@ -19,7 +21,7 @@ use std::io;
 /// This necessary for determinism because offchain data sources don't have a deterministic order of
 /// execution, for example an IPFS file may become available at any point in time. The isolation
 /// rules make the indexing result reproducible, given a set of available files.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, FromSqlRow)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, FromSqlRow, Hash, PartialOrd, Ord)]
 pub struct CausalityRegion(i32);
 
 impl fmt::Display for CausalityRegion {
@@ -47,10 +49,18 @@ impl CausalityRegion {
     pub const fn next(self) -> Self {
         CausalityRegion(self.0 + 1)
     }
+
+    pub fn from_entity(entity: &Entity) -> Self {
+        entity
+            .get("causality_region")
+            .and_then(|v| v.as_int())
+            .map(CausalityRegion)
+            .unwrap_or(CausalityRegion::ONCHAIN)
+    }
 }
 
 /// A subgraph will assign causality regions to offchain data sources from a sequence.
-pub struct CausalityRegionSeq(CausalityRegion);
+pub struct CausalityRegionSeq(pub CausalityRegion);
 
 impl CausalityRegionSeq {
     /// Create a new sequence with the current value set to `ONCHAIN`, which is 0, therefore the

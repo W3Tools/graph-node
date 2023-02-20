@@ -84,6 +84,17 @@ pub struct EnvVarsGraphQl {
     /// Set by the flag `GRAPH_GRAPHQL_MAX_OPERATIONS_PER_CONNECTION`.
     /// Defaults to 1000.
     pub max_operations_per_connection: usize,
+    /// Set by the flag `GRAPH_GRAPHQL_DISABLE_BOOL_FILTERS`. Off by default.
+    /// Disables AND/OR filters
+    pub disable_bool_filters: bool,
+    /// Set by the flag `GRAPH_GRAPHQL_DISABLE_CHILD_SORTING`. Off by default.
+    /// Disables child-based sorting
+    pub disable_child_sorting: bool,
+    /// Set by `GRAPH_GRAPHQL_TRACE_TOKEN`, the token to use to enable query
+    /// tracing for a GraphQL request. If this is set, requests that have a
+    /// header `X-GraphTraceQuery` set to this value will include a trace of
+    /// the SQL queries that were run.
+    pub query_trace_token: String,
 }
 
 // This does not print any values avoid accidentally leaking any sensitive env vars
@@ -128,6 +139,9 @@ impl From<InnerGraphQl> for EnvVarsGraphQl {
             warn_result_size: x.warn_result_size.0 .0,
             error_result_size: x.error_result_size.0 .0,
             max_operations_per_connection: x.max_operations_per_connection,
+            disable_bool_filters: x.disable_bool_filters.0,
+            disable_child_sorting: x.disable_child_sorting.0,
+            query_trace_token: x.query_trace_token,
         }
     }
 }
@@ -173,4 +187,10 @@ pub struct InnerGraphQl {
     error_result_size: WithDefaultUsize<NoUnderscores<usize>, { usize::MAX }>,
     #[envconfig(from = "GRAPH_GRAPHQL_MAX_OPERATIONS_PER_CONNECTION", default = "1000")]
     max_operations_per_connection: usize,
+    #[envconfig(from = "GRAPH_GRAPHQL_DISABLE_BOOL_FILTERS", default = "false")]
+    pub disable_bool_filters: EnvVarBoolean,
+    #[envconfig(from = "GRAPH_GRAPHQL_DISABLE_CHILD_SORTING", default = "false")]
+    pub disable_child_sorting: EnvVarBoolean,
+    #[envconfig(from = "GRAPH_GRAPHQL_TRACE_TOKEN", default = "")]
+    query_trace_token: String,
 }

@@ -1,10 +1,11 @@
 use clap::Parser as _;
-use ethereum::chain::{EthereumAdapterSelector, EthereumStreamBuilder};
+use ethereum::chain::{EthereumAdapterSelector, EthereumBlockRefetcher, EthereumStreamBuilder};
+use ethereum::codec::HeaderOnlyBlock;
 use ethereum::{
     BlockIngestor as EthereumBlockIngestor, EthereumAdapterTrait, EthereumNetworks, RuntimeAdapter,
 };
 use git_testament::{git_testament, render_testament};
-use graph::blockchain::firehose_block_ingestor::FirehoseBlockIngestor;
+use graph::blockchain::firehose_block_ingestor::{FirehoseBlockIngestor, Transforms};
 use graph::blockchain::{Block as BlockchainBlock, Blockchain, BlockchainKind, BlockchainMap};
 use graph::components::store::BlockStore;
 use graph::data::graphql::effort::LoadManager;
@@ -93,6 +94,7 @@ fn read_expensive_queries(
 async fn main() {
     env_logger::init();
 
+    let env_vars = Arc::new(EnvVars::from_env().unwrap());
     let opt = opt::Opt::parse();
 
     // Set up logger
@@ -189,8 +191,16 @@ async fn main() {
             client: reqwest::Client::new(),
         });
 
+    // Set up Prometheus registry
+    let prometheus_registry = Arc::new(Registry::new());
+    let metrics_registry = Arc::new(MetricsRegistry::new(
+        logger.clone(),
+        prometheus_registry.clone(),
+    ));
+
     // Create a component and subgraph logger factory
-    let logger_factory = LoggerFactory::new(logger.clone(), elastic_config);
+    let logger_factory =
+        LoggerFactory::new(logger.clone(), elastic_config, metrics_registry.clone());
 
     // Try to create IPFS clients for each URL specified in `--ipfs`
     let ipfs_clients: Vec<_> = create_ipfs_clients(&logger, &opt.ipfs);
@@ -204,17 +214,7 @@ async fn main() {
 
     // Convert the clients into a link resolver. Since we want to get past
     // possible temporary DNS failures, make the resolver retry
-    let link_resolver = Arc::new(LinkResolver::new(
-        ipfs_clients,
-        Arc::new(EnvVars::default()),
-    ));
-
-    // Set up Prometheus registry
-    let prometheus_registry = Arc::new(Registry::new());
-    let metrics_registry = Arc::new(MetricsRegistry::new(
-        logger.clone(),
-        prometheus_registry.clone(),
-    ));
+    let link_resolver = Arc::new(LinkResolver::new(ipfs_clients, env_vars.cheap_clone()));
     let mut metrics_server =
         PrometheusMetricsServer::new(&logger_factory, prometheus_registry.clone());
 
@@ -257,7 +257,7 @@ async fn main() {
     )
     .await;
 
-    let launch_services = |logger: Logger| async move {
+    let launch_services = |logger: Logger, env_vars: Arc<EnvVars>| async move {
         let subscription_manager = store_builder.subscription_manager();
         let chain_head_update_listener = store_builder.chain_head_update_listener();
         let primary_pool = store_builder.primary_pool();
@@ -375,13 +375,47 @@ async fn main() {
         if !opt.disable_block_ingestor {
             if ethereum_chains.len() > 0 {
                 let block_polling_interval = Duration::from_millis(opt.ethereum_polling_interval);
+                // Each chain contains both the rpc and firehose endpoints so provided
+                // IS_FIREHOSE_PREFERRED is set to true, a chain will use firehose if it has
+                // endpoints set but chains are essentially guaranteed to use EITHER firehose or RPC
+                // but will never start both.
+                let (firehose_eth_chains, polling_eth_chains): (HashMap<_, _>, HashMap<_, _>) =
+                    ethereum_chains
+                        .into_iter()
+                        .partition(|(_, chain)| chain.is_firehose_supported());
 
                 start_block_ingestor(
                     &logger,
                     &logger_factory,
                     block_polling_interval,
-                    ethereum_chains,
+                    polling_eth_chains,
                 );
+
+                firehose_networks_by_kind
+                    .get(&BlockchainKind::Ethereum)
+                    .map(|eth_firehose_endpoints| {
+                        start_firehose_block_ingestor::<_, HeaderOnlyBlock>(
+                            &logger,
+                            &network_store,
+                            firehose_eth_chains
+                                .into_iter()
+                                .map(|(name, chain)| {
+                                    let firehose_endpoints = eth_firehose_endpoints
+                                        .networks
+                                        .get(&name)
+                                        .expect(&format!("chain {} to have endpoints", name))
+                                        .clone();
+                                    (
+                                        name,
+                                        FirehoseChain {
+                                            chain,
+                                            firehose_endpoints,
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        )
+                    });
             }
 
             start_firehose_block_ingestor::<_, ArweaveBlock>(
@@ -415,6 +449,7 @@ async fn main() {
 
         let subgraph_instance_manager = SubgraphInstanceManager::new(
             &logger_factory,
+            env_vars.cheap_clone(),
             network_store.subgraph_store(),
             blockchain_map.cheap_clone(),
             metrics_registry.clone(),
@@ -534,15 +569,15 @@ async fn main() {
                 .compat(),
         );
 
-        graph::spawn(
+        graph::spawn(async move {
             metrics_server
                 .serve(metrics_port)
+                .await
                 .expect("Failed to start metrics server")
-                .compat(),
-        );
+        });
     };
 
-    graph::spawn(launch_services(logger.clone()));
+    graph::spawn(launch_services(logger.clone(), env_vars.cheap_clone()));
 
     // Periodically check for contention in the tokio threadpool. First spawn a
     // task that simply responds to "ping" requests. Then spawn a separate
@@ -695,6 +730,7 @@ fn ethereum_networks_as_chains(
                 eth_adapters.clone(),
                 chain_head_update_listener.clone(),
                 Arc::new(EthereumStreamBuilder {}),
+                Arc::new(EthereumBlockRefetcher {}),
                 Arc::new(adapter_selector),
                 runtime_adapter,
                 ethereum::ENV_VARS.reorg_threshold,
@@ -935,11 +971,15 @@ fn start_firehose_block_ingestor<C, M>(
 
             match store.block_store().chain_store(network_name.as_ref()) {
                 Some(s) => {
-                    let block_ingestor = FirehoseBlockIngestor::<M>::new(
+                    let mut block_ingestor = FirehoseBlockIngestor::<M>::new(
                         s,
                         endpoint.clone(),
                         logger.new(o!("component" => "FirehoseBlockIngestor", "provider" => endpoint.provider.clone())),
                     );
+
+                    if C::KIND == BlockchainKind::Ethereum {
+                        block_ingestor = block_ingestor.with_transforms(vec![Transforms::EthereumHeaderOnly]);
+                    }
 
                     // Run the Firehose block ingestor in the background
                     graph::spawn(block_ingestor.run());

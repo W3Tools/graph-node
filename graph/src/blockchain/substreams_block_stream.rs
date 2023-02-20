@@ -162,25 +162,21 @@ fn stream_blocks<C: Blockchain, F: SubstreamsMapper<C>>(
     module_name: String,
     manifest_start_block_num: BlockNumber,
     manifest_end_block_num: BlockNumber,
-    _subgraph_current_block: Option<BlockPtr>,
+    subgraph_current_block: Option<BlockPtr>,
     logger: Logger,
     metrics: SubstreamsBlockStreamMetrics,
 ) -> impl Stream<Item = Result<BlockStreamEvent<C>, Error>> {
     let mut latest_cursor = cursor.unwrap_or_else(|| "".to_string());
 
-    let start_block_num = manifest_start_block_num as i64;
-    let stop_block_num = manifest_end_block_num as u64;
+    let start_block_num = subgraph_current_block
+        .as_ref()
+        .map(|ptr| {
+            // current_block has already been processed, we start at next block
+            ptr.block_number() as i64 + 1
+        })
+        .unwrap_or(manifest_start_block_num as i64);
 
-    let request = Request {
-        start_block_num,
-        start_cursor: latest_cursor.clone(),
-        stop_block_num,
-        fork_steps: vec![StepNew as i32, StepUndo as i32],
-        irreversibility_condition: "".to_string(),
-        modules,
-        output_modules: vec![module_name],
-        ..Default::default()
-    };
+    let stop_block_num = manifest_end_block_num as u64;
 
     // Back off exponentially whenever we encounter a connection error or a stream with bad data
     let mut backoff = ExponentialBackoff::new(Duration::from_millis(500), Duration::from_secs(45));
@@ -203,7 +199,19 @@ fn stream_blocks<C: Blockchain, F: SubstreamsMapper<C>>(
             skip_backoff = false;
 
             let mut connect_start = Instant::now();
-            let result = endpoint.clone().substreams(request.clone()).await;
+            let request = Request {
+                start_block_num,
+                start_cursor: latest_cursor.clone(),
+                stop_block_num,
+                fork_steps: vec![StepNew as i32, StepUndo as i32],
+                irreversibility_condition: "".to_string(),
+                modules: modules.clone(),
+                output_modules: vec![module_name.clone()],
+                production_mode: true,
+                ..Default::default()
+            };
+
+            let result = endpoint.clone().substreams(request).await;
 
             match result {
                 Ok(stream) => {

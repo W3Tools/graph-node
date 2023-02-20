@@ -1,17 +1,21 @@
 use crate::{
+    blockchain::block_stream::FirehoseCursor,
     blockchain::Block as BlockchainBlock,
     blockchain::BlockPtr,
     cheap_clone::CheapClone,
     components::store::BlockNumber,
-    firehose::{decode_firehose_block, ForkStep},
+    firehose::decode_firehose_block,
     prelude::{anyhow, debug, info},
     substreams,
 };
+
+use anyhow::bail;
 use futures03::StreamExt;
 use http::uri::{Scheme, Uri};
 use slog::Logger;
 use std::{collections::BTreeMap, fmt::Display, sync::Arc, time::Duration};
 use tonic::{
+    codegen::CompressionEncoding,
     metadata::MetadataValue,
     transport::{Channel, ClientTlsConfig},
     Request,
@@ -19,7 +23,10 @@ use tonic::{
 
 use super::codec as firehose;
 
-const SUBGRAPHS_PER_CONN: usize = 100;
+/// This is constant because we found this magic number of connections after
+/// which the grpc connections start to hang.
+/// For more details see: https://github.com/graphprotocol/graph-node/issues/3879
+pub const SUBGRAPHS_PER_CONN: usize = 100;
 
 #[derive(Clone, Debug)]
 pub struct FirehoseEndpoint {
@@ -27,7 +34,26 @@ pub struct FirehoseEndpoint {
     pub token: Option<String>,
     pub filters_enabled: bool,
     pub compression_enabled: bool,
+    pub subgraph_limit: SubgraphLimit,
     channel: Channel,
+}
+
+// TODO: Find a new home for this type.
+#[derive(Clone, Debug, PartialEq, Ord, Eq, PartialOrd)]
+pub enum SubgraphLimit {
+    Disabled,
+    Limit(usize),
+    Unlimited,
+}
+
+impl SubgraphLimit {
+    pub fn has_capacity(&self, current: usize) -> bool {
+        match self {
+            SubgraphLimit::Unlimited => true,
+            SubgraphLimit::Limit(limit) => limit > &current,
+            SubgraphLimit::Disabled => false,
+        }
+    }
 }
 
 impl Display for FirehoseEndpoint {
@@ -43,6 +69,7 @@ impl FirehoseEndpoint {
         token: Option<String>,
         filters_enabled: bool,
         compression_enabled: bool,
+        subgraph_limit: SubgraphLimit,
     ) -> Self {
         let uri = url
             .as_ref()
@@ -75,12 +102,80 @@ impl FirehoseEndpoint {
             // Timeout on each request, so the timeout to estabilish each 'Blocks' stream.
             .timeout(Duration::from_secs(120));
 
+        let subgraph_limit = match subgraph_limit {
+            // See the comment on the constant
+            SubgraphLimit::Unlimited => SubgraphLimit::Limit(SUBGRAPHS_PER_CONN),
+            // This is checked when parsing from config but doesn't hurt to be defensive.
+            SubgraphLimit::Limit(limit) => SubgraphLimit::Limit(limit.min(SUBGRAPHS_PER_CONN)),
+            l => l,
+        };
+
         FirehoseEndpoint {
             provider: provider.as_ref().to_string(),
             channel: endpoint.connect_lazy(),
             token,
             filters_enabled,
             compression_enabled,
+            subgraph_limit,
+        }
+    }
+
+    // we need to -1 because there will always be a reference
+    // inside FirehoseEndpoints that is not used (is always cloned).
+    pub fn has_subgraph_capacity(self: &Arc<Self>) -> bool {
+        self.subgraph_limit
+            .has_capacity(Arc::strong_count(&self).checked_sub(1).unwrap_or(0))
+    }
+
+    pub async fn get_block<M>(
+        &self,
+        cursor: FirehoseCursor,
+        logger: &Logger,
+    ) -> Result<M, anyhow::Error>
+    where
+        M: prost::Message + BlockchainBlock + Default + 'static,
+    {
+        let token_metadata = match self.token.clone() {
+            Some(token) => Some(MetadataValue::try_from(token.as_str())?),
+            None => None,
+        };
+
+        let mut client = firehose::fetch_client::FetchClient::with_interceptor(
+            self.channel.cheap_clone(),
+            move |mut r: Request<()>| {
+                if let Some(ref t) = token_metadata {
+                    r.metadata_mut().insert("authorization", t.clone());
+                }
+
+                Ok(r)
+            },
+        )
+        .accept_compressed(CompressionEncoding::Gzip);
+
+        if self.compression_enabled {
+            client = client.send_compressed(CompressionEncoding::Gzip);
+        }
+
+        debug!(
+            logger,
+            "Connecting to firehose to retrieve block for cursor {}", cursor
+        );
+
+        let req = firehose::SingleBlockRequest {
+            transforms: [].to_vec(),
+            reference: Some(firehose::single_block_request::Reference::Cursor(
+                firehose::single_block_request::Cursor {
+                    cursor: cursor.to_string(),
+                },
+            )),
+        };
+        let resp = client.block(req);
+
+        match resp.await {
+            Ok(v) => Ok(M::decode(
+                v.get_ref().block.as_ref().unwrap().value.as_ref(),
+            )?),
+            Err(e) => return Err(anyhow::format_err!("firehose error {}", e)),
         }
     }
 
@@ -106,7 +201,7 @@ impl FirehoseEndpoint {
         M: prost::Message + BlockchainBlock + Default + 'static,
     {
         let token_metadata = match self.token.clone() {
-            Some(token) => Some(MetadataValue::from_str(token.as_str())?),
+            Some(token) => Some(MetadataValue::try_from(token.as_str())?),
             None => None,
         };
 
@@ -120,10 +215,10 @@ impl FirehoseEndpoint {
                 Ok(r)
             },
         )
-        .accept_gzip();
+        .accept_compressed(CompressionEncoding::Gzip);
 
         if self.compression_enabled {
-            client = client.send_gzip();
+            client = client.send_compressed(CompressionEncoding::Gzip);
         }
 
         debug!(
@@ -147,7 +242,7 @@ impl FirehoseEndpoint {
             .blocks(firehose::Request {
                 start_block_num: number as i64,
                 stop_block_num: number as u64,
-                fork_steps: vec![ForkStep::StepNew as i32, ForkStep::StepUndo as i32],
+                final_blocks_only: false,
                 ..Default::default()
             })
             .await?;
@@ -200,7 +295,7 @@ impl FirehoseEndpoint {
         request: firehose::Request,
     ) -> Result<tonic::Streaming<firehose::Response>, anyhow::Error> {
         let token_metadata = match self.token.clone() {
-            Some(token) => Some(MetadataValue::from_str(token.as_str())?),
+            Some(token) => Some(MetadataValue::try_from(token.as_str())?),
             None => None,
         };
 
@@ -214,9 +309,9 @@ impl FirehoseEndpoint {
                 Ok(r)
             },
         )
-        .accept_gzip();
+        .accept_compressed(CompressionEncoding::Gzip);
         if self.compression_enabled {
-            client = client.send_gzip();
+            client = client.send_compressed(CompressionEncoding::Gzip);
         }
 
         let response_stream = client.blocks(request).await?;
@@ -230,7 +325,7 @@ impl FirehoseEndpoint {
         request: substreams::Request,
     ) -> Result<tonic::Streaming<substreams::Response>, anyhow::Error> {
         let token_metadata = match self.token.clone() {
-            Some(token) => Some(MetadataValue::from_str(token.as_str())?),
+            Some(token) => Some(MetadataValue::try_from(token.as_str())?),
             None => None,
         };
 
@@ -272,8 +367,8 @@ impl FirehoseEndpoints {
             .iter()
             .min_by_key(|x| Arc::strong_count(x))
             .ok_or(anyhow!("no available firehose endpoints"))?;
-        if Arc::strong_count(endpoint) > SUBGRAPHS_PER_CONN {
-            return Err(anyhow!("all connections saturated with {} connections, increase the firehose conn_pool_size", SUBGRAPHS_PER_CONN));
+        if !endpoint.has_subgraph_capacity() {
+            bail!("all connections saturated with {} connections, increase the firehose conn_pool_size or limit for the node", SUBGRAPHS_PER_CONN);
         }
 
         // Cloning here ensure we have the correct count at any given time, if we return a reference it can be cloned later
@@ -341,22 +436,22 @@ impl FirehoseNetworks {
 
 #[cfg(test)]
 mod test {
-    use std::{mem, str::FromStr, sync::Arc};
+    use std::{mem, sync::Arc};
 
-    use http::Uri;
-    use tonic::transport::Channel;
+    use crate::firehose::SubgraphLimit;
 
     use super::{FirehoseEndpoint, FirehoseEndpoints, SUBGRAPHS_PER_CONN};
 
     #[tokio::test]
     async fn firehose_endpoint_errors() {
-        let endpoint = vec![Arc::new(FirehoseEndpoint {
-            provider: String::new(),
-            token: None,
-            filters_enabled: true,
-            compression_enabled: true,
-            channel: Channel::builder(Uri::from_str("http://127.0.0.1").unwrap()).connect_lazy(),
-        })];
+        let endpoint = vec![Arc::new(FirehoseEndpoint::new(
+            String::new(),
+            "http://127.0.0.1".to_string(),
+            None,
+            false,
+            false,
+            SubgraphLimit::Unlimited,
+        ))];
 
         let mut endpoints = FirehoseEndpoints::from(endpoint);
 
@@ -370,6 +465,60 @@ mod test {
 
         mem::drop(keep);
         endpoints.random().unwrap();
+
+        // Fails when empty too
+        endpoints.remove("");
+
+        let err = endpoints.random().unwrap_err();
+        assert!(err.to_string().contains("no available firehose endpoints"));
+    }
+
+    #[tokio::test]
+    async fn firehose_endpoint_with_limit() {
+        let endpoint = vec![Arc::new(FirehoseEndpoint::new(
+            String::new(),
+            "http://127.0.0.1".to_string(),
+            None,
+            false,
+            false,
+            SubgraphLimit::Limit(2),
+        ))];
+
+        let mut endpoints = FirehoseEndpoints::from(endpoint);
+
+        let mut keep = vec![];
+        for _ in 0..2 {
+            keep.push(endpoints.random().unwrap());
+        }
+
+        let err = endpoints.random().unwrap_err();
+        assert!(err.to_string().contains("conn_pool_size"));
+
+        mem::drop(keep);
+        endpoints.random().unwrap();
+
+        // Fails when empty too
+        endpoints.remove("");
+
+        let err = endpoints.random().unwrap_err();
+        assert!(err.to_string().contains("no available firehose endpoints"));
+    }
+
+    #[tokio::test]
+    async fn firehose_endpoint_no_traffic() {
+        let endpoint = vec![Arc::new(FirehoseEndpoint::new(
+            String::new(),
+            "http://127.0.0.1".to_string(),
+            None,
+            false,
+            false,
+            SubgraphLimit::Disabled,
+        ))];
+
+        let mut endpoints = FirehoseEndpoints::from(endpoint);
+
+        let err = endpoints.random().unwrap_err();
+        assert!(err.to_string().contains("conn_pool_size"));
 
         // Fails when empty too
         endpoints.remove("");

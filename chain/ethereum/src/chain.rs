@@ -8,7 +8,7 @@ use graph::slog::debug;
 use graph::{
     blockchain::{
         block_stream::{
-            BlockStreamEvent, BlockWithTriggers, FirehoseError,
+            BlockRefetcher, BlockStreamEvent, BlockWithTriggers, FirehoseError,
             FirehoseMapper as FirehoseMapperTrait, TriggersAdapter as TriggersAdapterTrait,
         },
         firehose_block_stream::FirehoseBlockStream,
@@ -64,10 +64,12 @@ impl BlockStreamBuilder<Chain> for EthereumStreamBuilder {
         let requirements = filter.node_capabilities();
         let adapter = chain
             .triggers_adapter(&deployment, &requirements, unified_api_version)
-            .expect(&format!(
-                "no adapter for network {} with capabilities {}",
-                chain.name, requirements
-            ));
+            .unwrap_or_else(|_| {
+                panic!(
+                    "no adapter for network {} with capabilities {}",
+                    chain.name, requirements
+                )
+            });
 
         let firehose_endpoint = chain.firehose_endpoints.random()?;
 
@@ -102,6 +104,30 @@ impl BlockStreamBuilder<Chain> for EthereumStreamBuilder {
         _unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Chain>>> {
         todo!()
+    }
+}
+
+pub struct EthereumBlockRefetcher {}
+
+#[async_trait]
+impl BlockRefetcher<Chain> for EthereumBlockRefetcher {
+    fn required(&self, chain: &Chain) -> bool {
+        chain.is_firehose_supported()
+    }
+
+    async fn get_block(
+        &self,
+        chain: &Chain,
+        logger: &Logger,
+        cursor: FirehoseCursor,
+    ) -> Result<BlockFinality, Error> {
+        let endpoint = chain.firehose_endpoints.random().context(
+            "expecting to always have at least one Firehose endpoint when this method is called",
+        )?;
+
+        let block = endpoint.get_block::<codec::Block>(cursor, logger).await?;
+        let ethereum_block: EthereumBlockWithCalls = (&block).try_into()?;
+        Ok(BlockFinality::NonFinal(ethereum_block))
     }
 }
 
@@ -140,7 +166,7 @@ impl TriggersAdapterSelector<Chain> for EthereumAdapterSelector {
     ) -> Result<Arc<dyn TriggersAdapterTrait<Chain>>, Error> {
         let logger = self
             .logger_factory
-            .subgraph_logger(&loc)
+            .subgraph_logger(loc)
             .new(o!("component" => "BlockStream"));
 
         let eth_adapter = if capabilities.traces && self.firehose_endpoints.len() > 0 {
@@ -150,9 +176,10 @@ impl TriggersAdapterSelector<Chain> for EthereumAdapterSelector {
                 traces: false,
             };
 
-            self.adapters.cheapest_with(&adjusted_capabilities)?.clone()
+            self.adapters
+                .call_or_cheapest(Some(&adjusted_capabilities))?
         } else {
-            self.adapters.cheapest_with(capabilities)?.clone()
+            self.adapters.cheapest_with(capabilities)?
         };
 
         let ethrpc_metrics = Arc::new(SubgraphEthRpcMetrics::new(self.registry.clone(), &loc.hash));
@@ -181,6 +208,7 @@ pub struct Chain {
     reorg_threshold: BlockNumber,
     pub is_ingestible: bool,
     block_stream_builder: Arc<dyn BlockStreamBuilder<Self>>,
+    block_refetcher: Arc<dyn BlockRefetcher<Self>>,
     adapter_selector: Arc<dyn TriggersAdapterSelector<Self>>,
     runtime_adapter: Arc<dyn RuntimeAdapterTrait<Self>>,
 }
@@ -204,6 +232,7 @@ impl Chain {
         eth_adapters: EthereumNetworkAdapters,
         chain_head_update_listener: Arc<dyn ChainHeadUpdateListener>,
         block_stream_builder: Arc<dyn BlockStreamBuilder<Self>>,
+        block_refetcher: Arc<dyn BlockRefetcher<Self>>,
         adapter_selector: Arc<dyn TriggersAdapterSelector<Self>>,
         runtime_adapter: Arc<dyn RuntimeAdapterTrait<Self>>,
         reorg_threshold: BlockNumber,
@@ -220,6 +249,7 @@ impl Chain {
             call_cache,
             chain_head_update_listener,
             block_stream_builder,
+            block_refetcher,
             adapter_selector,
             runtime_adapter,
             reorg_threshold,
@@ -233,7 +263,7 @@ impl Chain {
     }
 
     pub fn cheapest_adapter(&self) -> Arc<EthereumAdapter> {
-        self.eth_adapters.cheapest().unwrap().clone()
+        self.eth_adapters.cheapest().unwrap()
     }
 }
 
@@ -303,10 +333,12 @@ impl Blockchain for Chain {
         let requirements = filter.node_capabilities();
         let adapter = self
             .triggers_adapter(&deployment, &requirements, unified_api_version.clone())
-            .expect(&format!(
-                "no adapter for network {} with capabilities {}",
-                self.name, requirements
-            ));
+            .unwrap_or_else(|_| {
+                panic!(
+                    "no adapter for network {} with capabilities {}",
+                    self.name, requirements
+                )
+            });
 
         let logger = self
             .logger_factory
@@ -362,6 +394,18 @@ impl Blockchain for Chain {
             .block_pointer_from_number(logger, number)
             .compat()
             .await
+    }
+
+    fn is_refetch_block_required(&self) -> bool {
+        self.block_refetcher.required(self)
+    }
+
+    async fn refetch_firehose_block(
+        &self,
+        logger: &Logger,
+        cursor: FirehoseCursor,
+    ) -> Result<BlockFinality, Error> {
+        self.block_refetcher.get_block(self, logger, cursor).await
     }
 
     fn runtime_adapter(&self) -> Arc<dyn RuntimeAdapterTrait<Self>> {
@@ -526,8 +570,8 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
                     &filter.log,
                     &full_block.ethereum_block,
                 ));
-                triggers.append(&mut parse_call_triggers(&filter.call, &full_block)?);
-                triggers.append(&mut parse_block_triggers(&filter.block, &full_block));
+                triggers.append(&mut parse_call_triggers(&filter.call, full_block)?);
+                triggers.append(&mut parse_block_triggers(&filter.block, full_block));
                 Ok(BlockWithTriggers::new(block, triggers, logger))
             }
         }
@@ -640,11 +684,11 @@ impl FirehoseMapperTrait<Chain> for FirehoseMapper {
                 ))
             }
 
-            StepIrreversible => {
+            StepFinal => {
                 unreachable!("irreversible step is not handled and should not be requested in the Firehose request")
             }
 
-            StepUnknown => {
+            StepUnset => {
                 unreachable!("unknown step should not happen in the Firehose response")
             }
         }

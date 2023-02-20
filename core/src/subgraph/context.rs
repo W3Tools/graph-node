@@ -30,7 +30,7 @@ pub type SharedInstanceKeepAliveMap = Arc<RwLock<HashMap<DeploymentId, CancelGua
 // Currently most of the changes are applied in `runner.rs`, but ideally more of that would be
 // refactored into the context so it wouldn't need `pub` fields. The entity cache should probably
 // also be moved here.
-pub(crate) struct IndexingContext<C, T>
+pub struct IndexingContext<C, T>
 where
     T: RuntimeHostBuilder<C>,
     C: Blockchain,
@@ -72,7 +72,7 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
     ) -> Result<BlockState<C>, MappingError> {
         self.process_trigger_in_hosts(
             logger,
-            &self.instance.hosts(),
+            self.instance.hosts(),
             block,
             trigger,
             state,
@@ -111,15 +111,21 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
             .await
     }
 
-    // Removes data sources hosts with a creation block greater or equal to `reverted_block`, so
-    // that they are no longer candidates for `process_trigger`.
-    //
-    // This does not currently affect the `offchain_monitor` or the `filter`, so they will continue
-    // to include data sources that have been reverted. This is not ideal for performance, but it
-    // does not affect correctness since triggers that have no matching host will be ignored by
-    // `process_trigger`.
-    pub fn revert_data_sources(&mut self, reverted_block: BlockNumber) {
-        self.instance.revert_data_sources(reverted_block)
+    /// Removes data sources hosts with a creation block greater or equal to `reverted_block`, so
+    /// that they are no longer candidates for `process_trigger`.
+    ///
+    /// This does not currently affect the `offchain_monitor` or the `filter`, so they will continue
+    /// to include data sources that have been reverted. This is not ideal for performance, but it
+    /// does not affect correctness since triggers that have no matching host will be ignored by
+    /// `process_trigger`.
+    ///
+    /// File data sources that have been marked not done during this process will get re-queued
+    pub fn revert_data_sources(&mut self, reverted_block: BlockNumber) -> Result<(), Error> {
+        let removed = self.instance.revert_data_sources(reverted_block);
+
+        removed
+            .into_iter()
+            .try_for_each(|source| self.offchain_monitor.add_source(source))
     }
 
     pub fn add_dynamic_data_source(
@@ -142,9 +148,14 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
     pub fn causality_region_next_value(&mut self) -> CausalityRegion {
         self.instance.causality_region_next_value()
     }
+
+    #[cfg(debug_assertions)]
+    pub fn instance(&self) -> &SubgraphInstance<C, T> {
+        &self.instance
+    }
 }
 
-pub(crate) struct OffchainMonitor {
+pub struct OffchainMonitor {
     ipfs_monitor: PollingMonitor<CidFile>,
     ipfs_monitor_rx: mpsc::Receiver<(CidFile, Bytes)>,
 }

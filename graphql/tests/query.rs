@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate pretty_assertions;
 
-use graph::components::store::{EntityKey, EntityType};
+use graph::components::store::EntityKey;
 use graph::data::subgraph::schema::DeploymentCreate;
 use graph::entity;
 use graph::prelude::SubscriptionResult;
@@ -34,9 +34,9 @@ use graph::{
 };
 use graph_graphql::{prelude::*, subscription::execute_subscription};
 use test_store::{
-    deployment_state, execute_subgraph_query_with_deadline, graphql_metrics, revert_block,
-    run_test_sequentially, transact_errors, Store, BLOCK_ONE, GENESIS_PTR, LOAD_MANAGER, LOGGER,
-    METRICS_REGISTRY, STORE, SUBSCRIPTION_MANAGER,
+    deployment_state, execute_subgraph_query, execute_subgraph_query_with_deadline,
+    graphql_metrics, revert_block, run_test_sequentially, transact_errors, Store, BLOCK_ONE,
+    GENESIS_PTR, LOAD_MANAGER, LOGGER, METRICS_REGISTRY, STORE, SUBSCRIPTION_MANAGER,
 };
 
 const NETWORK_NAME: &str = "fake_network";
@@ -170,6 +170,7 @@ fn test_schema(id: DeploymentHash, id_type: IdType) -> Schema {
 
     type Song @entity {
         id: @ID@!
+        sid: String!
         title: String!
         writtenBy: Musician!
         publisher: Publisher!
@@ -189,53 +190,45 @@ fn test_schema(id: DeploymentHash, id_type: IdType) -> Schema {
         id: Bytes!
     }
 
-    interface Review {
+    interface Review @entity {
         id: ID!
         body: String!
-        author: User!
+        author: Author!
     }
 
     type SongReview implements Review @entity {
         id: ID!
         body: String!
         song: Song
-        author: User!
+        author: Author!
     }
 
     type BandReview implements Review @entity {
         id: ID!
         body: String!
         band: Band
-        author: User!
-    }
-
-    type User @entity {
-        id: ID!
-        name: String!
-        bandReviews: [BandReview!]! @derivedFrom(field: \"author\")
-        songReviews: [SongReview!]! @derivedFrom(field: \"author\")
-        reviews: [Review!]! @derivedFrom(field: \"author\")
-        latestSongReview: SongReview!
-        latestBandReview: BandReview!
-        latestReview: Review!
+        author: Author!
     }
 
     interface Media {
         id: ID!
         title: String!
         song: Song!
+        author: User!
     }
 
     type Photo implements Media @entity {
         id: ID!
         title: String!
         song: Song! @derivedFrom(field: \"media\")
+        author: User!
     }
 
     type Video implements Media @entity {
         id: ID!
         title: String!
         song: Song! @derivedFrom(field: \"media\")
+        author: User!
     }
 
     interface Release {
@@ -256,6 +249,29 @@ fn test_schema(id: DeploymentHash, id_type: IdType) -> Schema {
         id: ID!
         title: String!
         songs: [Song!]!
+    }
+
+    interface Author {
+        id: ID!
+        name: String!
+    }
+
+    type User implements Author @entity {
+        id: ID!
+        name: String!
+        reviews: [Review!]! @derivedFrom(field: \"author\")
+        bandReviews: [BandReview!]! @derivedFrom(field: \"author\")
+        songReviews: [SongReview!]! @derivedFrom(field: \"author\")
+        latestSongReview: SongReview!
+        latestBandReview: BandReview!
+        latestReview: Review!
+        medias: [Media!]! @derivedFrom(field: \"author\")
+    }
+
+    type AnonymousUser implements Author @entity {
+        id: ID!
+        name: String!
+        reviews: [Review!]! @derivedFrom(field: \"author\")
     }
     ";
 
@@ -289,27 +305,30 @@ async fn insert_test_entities(
         entity! { __typename: "Publisher", id: "0xb1" },
         entity! { __typename: "Band", id: "b1", name: "The Musicians", originalSongs: vec![s[1], s[2]] },
         entity! { __typename: "Band", id: "b2", name: "The Amateurs",  originalSongs: vec![s[1], s[3], s[4]] },
-        entity! { __typename: "Song", id: s[1], title: "Cheesy Tune",  publisher: "0xb1", writtenBy: "m1", media: vec![md[1], md[2]] },
-        entity! { __typename: "Song", id: s[2], title: "Rock Tune",    publisher: "0xb1", writtenBy: "m2", media: vec![md[3], md[4]] },
-        entity! { __typename: "Song", id: s[3], title: "Pop Tune",     publisher: "0xb1", writtenBy: "m1", media: vec![md[5]] },
-        entity! { __typename: "Song", id: s[4], title: "Folk Tune",    publisher: "0xb1", writtenBy: "m3", media: vec![md[6]] },
+        entity! { __typename: "Song", id: s[1], sid: "s1", title: "Cheesy Tune",  publisher: "0xb1", writtenBy: "m1", media: vec![md[1], md[2]] },
+        entity! { __typename: "Song", id: s[2], sid: "s2", title: "Rock Tune",    publisher: "0xb1", writtenBy: "m2", media: vec![md[3], md[4]] },
+        entity! { __typename: "Song", id: s[3], sid: "s3", title: "Pop Tune",     publisher: "0xb1", writtenBy: "m1", media: vec![md[5]] },
+        entity! { __typename: "Song", id: s[4], sid: "s4", title: "Folk Tune",    publisher: "0xb1", writtenBy: "m3", media: vec![md[6]] },
         entity! { __typename: "SongStat", id: s[1], played: 10 },
         entity! { __typename: "SongStat", id: s[2], played: 15 },
-        entity! { __typename: "BandReview", id: "r1", body: "Bad musicians", band: "b1", author: "u1" },
-        entity! { __typename: "BandReview", id: "r2", body: "Good amateurs", band: "b2", author: "u2" },
-        entity! { __typename: "SongReview", id: "r3", body: "Bad", song: s[2], author: "u1" },
-        entity! { __typename: "SongReview", id: "r4", body: "Good", song: s[3], author: "u2" },
-        entity! { __typename: "User", id: "u1", name: "Baden", latestSongReview: "r3", latestBandReview: "r1", latestReview: "r1" },
-        entity! { __typename: "User", id: "u2", name: "Goodwill", latestSongReview: "r4", latestBandReview: "r2", latestReview: "r2" },
-        entity! { __typename: "Photo", id: md[1], title: "Cheesy Tune Single Cover" },
-        entity! { __typename: "Video", id: md[2], title: "Cheesy Tune Music Video" },
-        entity! { __typename: "Photo", id: md[3], title: "Rock Tune Single Cover" },
-        entity! { __typename: "Video", id: md[4], title: "Rock Tune Music Video" },
-        entity! { __typename: "Photo", id: md[5], title: "Pop Tune Single Cover" },
-        entity! { __typename: "Video", id: md[6], title: "Folk Tune Music Video" },
-        entity! { __typename: "Album", id: "rl1", title: "Pop and Folk", songs: vec![s[3], s[4]] },
-        entity! { __typename: "Single", id: "rl2", title: "Rock", songs: vec![s[2]] },
-        entity! { __typename: "Single", id: "rl3", title: "Cheesy", songs: vec![s[1]] },
+        entity! { __typename: "BandReview", id: "r1", body: "Bad musicians",        band: "b1", author: "u1" },
+        entity! { __typename: "BandReview", id: "r2", body: "Good amateurs",        band: "b2", author: "u2" },
+        entity! { __typename: "BandReview", id: "r5", body: "Very Bad musicians",   band: "b1", author: "u3" },
+        entity! { __typename: "SongReview", id: "r3", body: "Bad",                  song: s[2], author: "u1" },
+        entity! { __typename: "SongReview", id: "r4", body: "Good",                 song: s[3], author: "u2" },
+        entity! { __typename: "SongReview", id: "r6", body: "Very Bad",             song: s[2], author: "u3" },
+        entity! { __typename: "User",           id: "u1", name: "Baden",        latestSongReview: "r3", latestBandReview: "r1", latestReview: "r1" },
+        entity! { __typename: "User",           id: "u2", name: "Goodwill",     latestSongReview: "r4", latestBandReview: "r2", latestReview: "r2" },
+        entity! { __typename: "AnonymousUser",  id: "u3", name: "Anonymous 3",  latestSongReview: "r6", latestBandReview: "r5", latestReview: "r5" },
+        entity! { __typename: "Photo", id: md[1],   title: "Cheesy Tune Single Cover",  author: "u1" },
+        entity! { __typename: "Video", id: md[2],   title: "Cheesy Tune Music Video",   author: "u2" },
+        entity! { __typename: "Photo", id: md[3],   title: "Rock Tune Single Cover",    author: "u1" },
+        entity! { __typename: "Video", id: md[4],   title: "Rock Tune Music Video",     author: "u2" },
+        entity! { __typename: "Photo", id: md[5],   title: "Pop Tune Single Cover",     author: "u1" },
+        entity! { __typename: "Video", id: md[6],   title: "Folk Tune Music Video",     author: "u2" },
+        entity! { __typename: "Album", id: "rl1",   title: "Pop and Folk",    songs: vec![s[3], s[4]] },
+        entity! { __typename: "Single", id: "rl2",  title: "Rock",           songs: vec![s[2]] },
+        entity! { __typename: "Single", id: "rl3",  title: "Cheesy",         songs: vec![s[1]] },
     ];
 
     let entities1 = vec![
@@ -319,12 +338,10 @@ async fn insert_test_entities(
 
     async fn insert_at(entities: Vec<Entity>, deployment: &DeploymentLocator, block_ptr: BlockPtr) {
         let insert_ops = entities.into_iter().map(|data| EntityOperation::Set {
-            key: EntityKey {
-                entity_type: EntityType::new(
-                    data.get("__typename").unwrap().clone().as_string().unwrap(),
-                ),
-                entity_id: data.get("id").unwrap().clone().as_string().unwrap().into(),
-            },
+            key: EntityKey::data(
+                data.get("__typename").unwrap().clone().as_string().unwrap(),
+                data.get("id").unwrap().clone().as_string().unwrap(),
+            ),
             data,
         });
 
@@ -363,7 +380,7 @@ async fn execute_query_document_with_variables(
         METRICS_REGISTRY.clone(),
     ));
     let target = QueryTarget::Deployment(id.clone(), Default::default());
-    let query = Query::new(query, variables);
+    let query = Query::new(query, variables, false);
 
     runner
         .run_query_with_complexity(query, target, None, None, None, None)
@@ -397,6 +414,16 @@ impl From<&str> for QueryArgs {
     fn from(query: &str) -> Self {
         QueryArgs {
             query: query.to_owned(),
+            variables: None,
+            max_complexity: None,
+        }
+    }
+}
+
+impl From<String> for QueryArgs {
+    fn from(query: String) -> Self {
+        QueryArgs {
+            query,
             variables: None,
             max_complexity: None,
         }
@@ -464,7 +491,7 @@ where
                     METRICS_REGISTRY.clone(),
                 ));
                 let target = QueryTarget::Deployment(id.clone(), Default::default());
-                let query = Query::new(query, variables);
+                let query = Query::new(query, variables, false);
 
                 runner
                     .run_query_with_complexity(query, target, max_complexity, None, None, None)
@@ -497,6 +524,7 @@ async fn run_subscription(
     let query = Query::new(
         graphql_parser::parse_query(query).unwrap().into_static(),
         None,
+        false,
     );
     let options = SubscriptionExecutionOptions {
         logger: logger.clone(),
@@ -657,6 +685,279 @@ fn can_query_many_to_many_relationship() {
         let data = extract_data!(result).unwrap();
         assert_eq!(data, exp);
     })
+}
+
+#[test]
+fn can_query_with_sorting_by_child_entity() {
+    const QUERY: &str = "
+    query {
+        desc: musicians(first: 100, orderBy: mainBand__name, orderDirection: desc) {
+            name
+            mainBand {
+                name
+            }
+        }
+        asc: musicians(first: 100, orderBy: mainBand__name, orderDirection: asc) {
+            name
+            mainBand {
+                name
+            }
+        }
+    }";
+
+    run_query(QUERY, |result, _| {
+        let exp = object! {
+            desc: vec![
+                object! { name: "Valerie", mainBand: r::Value::Null },
+                object! { name: "Lisa", mainBand: object! { name: "The Musicians" } },
+                object! { name: "John", mainBand: object! { name: "The Musicians" } },
+                object! { name: "Tom",  mainBand: object! { name: "The Amateurs"} },
+                ],
+            asc: vec![
+                object! { name: "Tom",  mainBand: object! { name: "The Amateurs"} },
+                object! { name: "John", mainBand: object! { name: "The Musicians" } },
+                object! { name: "Lisa", mainBand: object! { name: "The Musicians" } },
+                object! { name: "Valerie", mainBand: r::Value::Null },
+                ]
+        };
+
+        let data = extract_data!(result).unwrap();
+        assert_eq!(data, exp);
+    })
+}
+
+#[test]
+fn can_query_with_sorting_by_derived_child_entity() {
+    const QUERY: &str = "
+    query {
+        desc: songStats(first: 100, orderBy: song__title, orderDirection: desc) {
+            id
+            song {
+              id
+              title
+            }
+            played
+        }
+        asc: songStats(first: 100, orderBy: song__title, orderDirection: asc) {
+            id
+            song {
+              id
+              title
+            }
+            played
+        }
+    }";
+
+    run_query(QUERY, |result, id_type| {
+        let s = id_type.songs();
+        let exp = object! {
+            desc: vec![
+                object! {
+                    id: s[2],
+                    song: object! { id: s[2], title: "Rock Tune" },
+                    played: 15
+                },
+                object! {
+                    id: s[1],
+                    song: object! { id: s[1], title: "Cheesy Tune" },
+                    played: 10,
+                }
+            ],
+            asc: vec![
+                object! {
+                    id: s[1],
+                    song: object! { id: s[1], title: "Cheesy Tune" },
+                    played: 10,
+                },
+                object! {
+                    id: s[2],
+                    song: object! { id: s[2], title: "Rock Tune" },
+                    played: 15
+                }
+            ]
+        };
+
+        let data = extract_data!(result).unwrap();
+        assert_eq!(data, exp);
+    })
+}
+
+#[test]
+fn can_query_with_sorting_by_child_entity_id() {
+    const QUERY: &str = "
+    query {
+        desc: bandReviews(first: 100, orderBy: author__id, orderDirection: desc) {
+            body
+            author {
+                name
+            }
+        }
+        asc: bandReviews(first: 100, orderBy: author__id, orderDirection: asc) {
+            body
+            author {
+                name
+            }
+        }
+    }";
+
+    run_query(QUERY, |result, _| {
+        let exp = object! {
+            desc: vec![
+                object! { body: "Very Bad musicians",   author: object! { name: "Anonymous 3"  } },
+                object! { body: "Good amateurs",        author: object! { name: "Goodwill" } },
+                object! { body: "Bad musicians",        author: object! { name: "Baden" } },
+                ],
+            asc: vec![
+                object! { body: "Bad musicians",        author: object! { name: "Baden" } },
+                object! { body: "Good amateurs",        author: object! { name: "Goodwill" } },
+                object! { body: "Very Bad musicians",   author: object! { name: "Anonymous 3"  } },
+                ]
+        };
+
+        let data = extract_data!(result).unwrap();
+        assert_eq!(data, exp);
+    })
+}
+
+#[test]
+fn can_query_with_sorting_by_derived_child_entity_id() {
+    const QUERY: &str = "
+    query {
+        desc: songStats(first: 100, orderBy: song__id, orderDirection: desc) {
+            id
+            song {
+              id
+              title
+            }
+            played
+        }
+        asc: songStats(first: 100, orderBy: song__id, orderDirection: asc) {
+            id
+            song {
+              id
+              title
+            }
+            played
+        }
+    }";
+
+    run_query(QUERY, |result, id_type| {
+        let s = id_type.songs();
+        let exp = object! {
+            desc: vec![
+                object! {
+                    id: s[2],
+                    song: object! { id: s[2], title: "Rock Tune" },
+                    played: 15
+                },
+                object! {
+                    id: s[1],
+                    song: object! { id: s[1], title: "Cheesy Tune" },
+                    played: 10,
+                }
+            ],
+            asc: vec![
+                object! {
+                    id: s[1],
+                    song: object! { id: s[1], title: "Cheesy Tune" },
+                    played: 10,
+                },
+                object! {
+                    id: s[2],
+                    song: object! { id: s[2], title: "Rock Tune" },
+                    played: 15
+                }
+            ]
+        };
+
+        let data = extract_data!(result).unwrap();
+        assert_eq!(data, exp);
+    })
+}
+
+#[test]
+fn can_query_with_sorting_by_child_interface() {
+    const QUERY: &str = "
+    query {
+        desc: songReviews(first: 100, orderBy: author__name, orderDirection: desc) {
+            body
+            author {
+                name
+            }
+        }
+        asc: songReviews(first: 100, orderBy: author__name, orderDirection: asc) {
+            body
+            author {
+                name
+            }
+        }
+    }";
+
+    run_query(QUERY, |result, _| {
+        let exp = object! {
+            desc: vec![
+                object! { body: "Good", author: object! { name: "Goodwill" } },
+                object! { body: "Bad", author: object! { name: "Baden" } },
+                object! { body: "Very Bad", author: object! { name: "Anonymous 3" } },
+                ],
+            asc: vec![
+                object! { body: "Very Bad", author: object! { name: "Anonymous 3" } },
+                object! { body: "Bad", author: object! { name: "Baden" } },
+                object! { body: "Good", author: object! { name: "Goodwill" } },
+                ]
+        };
+
+        let data = extract_data!(result).unwrap();
+        assert_eq!(data, exp);
+    })
+}
+
+#[test]
+fn can_not_query_interface_with_sorting_by_child_entity() {
+    const QUERY: &str = "
+    query {
+        desc: medias(first: 100, orderBy: author__name, orderDirection: desc) {
+            title
+            author {
+                name
+            }
+        }
+        asc: medias(first: 100, orderBy: author__name, orderDirection: asc) {
+            title
+            author {
+                name
+            }
+        }
+    }";
+
+    run_query(QUERY, |result, _| {
+        // Sorting an interface by child-level entity (derived) is not supported
+        assert!(result.has_errors());
+    });
+}
+
+#[test]
+fn can_not_query_interface_with_sorting_by_derived_child_entity() {
+    const QUERY: &str = "
+    query {
+        desc: medias(first: 100, orderBy: song__title, orderDirection: desc) {
+            title
+            song {
+                title
+            }
+        }
+        asc: medias(first: 100, orderBy: song__title, orderDirection: asc) {
+            title
+            song {
+                title
+            }
+        }
+    }";
+
+    run_query(QUERY, |result, _| {
+        // Sorting an interface by child-level entity is not supported
+        assert!(result.has_errors());
+    });
 }
 
 #[test]
@@ -1254,6 +1555,7 @@ fn instant_timeout() {
                 .unwrap()
                 .into_static(),
             None,
+            false,
         );
 
         match first_result(
@@ -2122,4 +2424,195 @@ fn deterministic_error() {
         });
         assert_eq!(expected, serde_json::to_value(&result).unwrap());
     })
+}
+
+#[test]
+fn can_query_with_or_filter() {
+    const QUERY: &str = "
+    query {
+        musicians(where: { or: [{ name: \"John\" }, { id: \"m2\" }] }) {
+            name
+            id
+        }
+    }
+    ";
+
+    run_query(QUERY, |result, _| {
+        let exp = object! {
+            musicians: vec![
+                object! { name: "John", id: "m1" },
+                object! { name: "Lisa", id: "m2" },
+            ],
+        };
+        let data = extract_data!(result).unwrap();
+        assert_eq!(data, exp);
+    })
+}
+
+#[test]
+fn can_query_with_or_filter_fields_always_and() {
+    const QUERY: &str = "
+    query {
+        musicians(where: { or: [{ name: \"John\", id: \"m2\" }] }) {
+            name
+            id
+        }
+    }
+    ";
+
+    run_query(QUERY, |result, _| {
+        let exp = object! {
+            musicians: r::Value::List(vec![]),
+        };
+        let data = extract_data!(result).unwrap();
+        assert_eq!(data, exp);
+    })
+}
+
+#[test]
+fn can_query_with_and_filter() {
+    const QUERY: &str = "
+    query {
+        musicians(where: { and: [{ name: \"John\", id: \"m2\" }] }) {
+          name
+          id
+        }
+      }
+    ";
+
+    run_query(QUERY, |result, _| {
+        let exp = object! {
+            musicians: r::Value::List(vec![]),
+        };
+        let data = extract_data!(result).unwrap();
+        assert_eq!(data, exp);
+    })
+}
+
+#[test]
+fn can_query_with_or_and_filter() {
+    const QUERY: &str = "
+    query {
+        musicians(
+            where: { or: [{ name: \"John\", id: \"m1\" }, { mainBand: \"b2\" }] }
+        ) {
+          name
+          id
+        }
+      }
+    ";
+
+    run_query(QUERY, |result, _| {
+        let exp = object! {
+            musicians: vec![
+                object! { name: "John", id: "m1" },
+                object! { name: "Tom", id: "m3" },
+            ],
+        };
+        let data = extract_data!(result).unwrap();
+        assert_eq!(data, exp);
+    })
+}
+
+#[test]
+fn can_query_with_or_explicit_and_filter() {
+    const QUERY: &str = "
+    query {
+        musicians(
+          where: { or: [{ and: [{ name: \"John\", id: \"m1\" }] }, { mainBand: \"b2\" }] }
+        ) {
+          name
+          id
+        }
+      }
+    ";
+
+    run_query(QUERY, |result, _| {
+        let exp = object! {
+            musicians: vec![
+                object! { name: "John", id: "m1" },
+                object! { name: "Tom", id: "m3" },
+            ],
+        };
+        let data = extract_data!(result).unwrap();
+        assert_eq!(data, exp);
+    })
+}
+
+#[test]
+fn can_query_with_or_implicit_and_filter() {
+    const QUERY: &str = "
+    query {
+        musicians(
+          where: { or: [{ name: \"John\", id: \"m1\" }, { name: \"Lisa\", id: \"m2\" }] }
+        ) {
+          name
+          id
+        }
+      }
+    ";
+
+    run_query(QUERY, |result, _| {
+        let exp = object! {
+            musicians: vec![
+                object! { name: "John", id: "m1" },
+                object! { name: "Lisa", id: "m2" },
+            ],
+        };
+        let data = extract_data!(result).unwrap();
+        assert_eq!(data, exp);
+    })
+}
+
+#[test]
+fn trace_works() {
+    run_test_sequentially(|store| async move {
+        let deployment = setup_readonly(store.as_ref()).await;
+        let query = Query::new(
+            graphql_parser::parse_query("query { musicians(first: 100) { name } }")
+                .unwrap()
+                .into_static(),
+            None,
+            true,
+        );
+
+        let result = execute_subgraph_query(
+            query,
+            QueryTarget::Deployment(deployment.hash.into(), Default::default()),
+        )
+        .await;
+
+        let trace = &result.first().unwrap().trace;
+        assert!(!trace.is_none(), "result has a trace");
+    })
+}
+
+/// Check that various comparisons against `id` work as expected. This also
+/// serves as a test that they work for `String` as well as `Bytes` fields
+/// in general
+#[test]
+fn can_compare_id() {
+    // For each entry `(cond, sids)` in this array, check that a query with
+    // a where clause `cond` returns a list of songs whose `sid` are the
+    // ones listed in `sids`
+    let checks = [
+        ("id_gt:  @S2@", vec!["s3", "s4"]),
+        ("id_gte: @S2@", vec!["s2", "s3", "s4"]),
+        ("id_lt:  @S2@", vec!["s1"]),
+        ("id_lte: @S2@", vec!["s1", "s2"]),
+        ("id_not: @S2@", vec!["s1", "s3", "s4"]),
+    ];
+
+    for (cond, sids) in checks {
+        let query = format!("query {{ songs(where: {{ {cond} }}) {{ sid }} }}");
+        let sids: Vec<_> = sids
+            .iter()
+            .map(|sid| object! { sid: sid.to_string() })
+            .collect();
+        let exp = object! { songs: sids };
+        run_query(query, move |result, id_type| {
+            let data = extract_data!(result).unwrap();
+            assert_eq!(data, exp, "check {} for {:?} ids", cond, id_type);
+        })
+    }
 }

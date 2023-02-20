@@ -20,6 +20,7 @@ impl GraphQLMetrics for TestGraphQLMetrics {
     fn observe_query_execution(&self, _duration: Duration, _results: &QueryResults) {}
     fn observe_query_parsing(&self, _duration: Duration, _results: &QueryResults) {}
     fn observe_query_validation(&self, _duration: Duration, _id: &DeploymentHash) {}
+    fn observe_query_validation_error(&self, _error_codes: Vec<&str>, _id: &DeploymentHash) {}
 }
 
 /// A simple stupid query runner for testing.
@@ -88,6 +89,8 @@ impl GraphQlRunner for TestGraphQlRunner {
 
 #[cfg(test)]
 mod test {
+    use graph_mock::MockMetricsRegistry;
+
     use super::*;
 
     lazy_static! {
@@ -100,7 +103,7 @@ mod test {
         runtime
             .block_on(async {
                 let logger = Logger::root(slog::Discard, o!());
-                let logger_factory = LoggerFactory::new(logger, None);
+                let logger_factory = LoggerFactory::new(logger, None, Arc::new(MockMetricsRegistry::new()));
                 let id = USERS.clone();
                 let query_runner = Arc::new(TestGraphQlRunner);
                 let node_id = NodeId::new("test").unwrap();
@@ -141,7 +144,8 @@ mod test {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let logger = Logger::root(slog::Discard, o!());
-            let logger_factory = LoggerFactory::new(logger, None);
+            let logger_factory =
+                LoggerFactory::new(logger, None, Arc::new(MockMetricsRegistry::new()));
             let id = USERS.clone();
             let query_runner = Arc::new(TestGraphQlRunner);
             let node_id = NodeId::new("test").unwrap();
@@ -221,7 +225,8 @@ mod test {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let logger = Logger::root(slog::Discard, o!());
-            let logger_factory = LoggerFactory::new(logger, None);
+            let logger_factory =
+                LoggerFactory::new(logger, None, Arc::new(MockMetricsRegistry::new()));
             let id = USERS.clone();
             let query_runner = Arc::new(TestGraphQlRunner);
             let node_id = NodeId::new("test").unwrap();
@@ -266,7 +271,8 @@ mod test {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _ = runtime.block_on(async {
             let logger = Logger::root(slog::Discard, o!());
-            let logger_factory = LoggerFactory::new(logger, None);
+            let logger_factory =
+                LoggerFactory::new(logger, None, Arc::new(MockMetricsRegistry::new()));
             let id = USERS.clone();
             let query_runner = Arc::new(TestGraphQlRunner);
             let node_id = NodeId::new("test").unwrap();

@@ -11,8 +11,8 @@ use graph::{
             FirehoseMapper as FirehoseMapperTrait, TriggersAdapter as TriggersAdapterTrait,
         },
         firehose_block_stream::FirehoseBlockStream,
-        Block as _, BlockHash, BlockPtr, Blockchain, BlockchainKind, IngestorError,
-        RuntimeAdapter as RuntimeAdapterTrait,
+        Block as _, BlockHash, BlockPtr, Blockchain, BlockchainKind, EmptyNodeCapabilities,
+        IngestorError, RuntimeAdapter as RuntimeAdapterTrait,
     },
     components::store::DeploymentLocator,
     firehose::{self, FirehoseEndpoint, FirehoseEndpoints, ForkStep},
@@ -20,7 +20,6 @@ use graph::{
 };
 use prost::Message;
 
-use crate::capabilities::NodeCapabilities;
 use crate::data_source::{
     DataSource, DataSourceTemplate, EventOrigin, UnresolvedDataSource, UnresolvedDataSourceTemplate,
 };
@@ -80,7 +79,18 @@ impl Blockchain for Chain {
 
     type TriggerFilter = TriggerFilter;
 
-    type NodeCapabilities = NodeCapabilities;
+    type NodeCapabilities = EmptyNodeCapabilities<Self>;
+
+    fn is_refetch_block_required(&self) -> bool {
+        false
+    }
+    async fn refetch_firehose_block(
+        &self,
+        _logger: &Logger,
+        _cursor: FirehoseCursor,
+    ) -> Result<codec::Block, Error> {
+        unimplemented!("This chain does not support Dynamic Data Sources. is_refetch_block_required always returns false, this shouldn't be called.")
+    }
 
     fn triggers_adapter(
         &self,
@@ -102,7 +112,11 @@ impl Blockchain for Chain {
         unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Self>>, Error> {
         let adapter = self
-            .triggers_adapter(&deployment, &NodeCapabilities {}, unified_api_version)
+            .triggers_adapter(
+                &deployment,
+                &EmptyNodeCapabilities::default(),
+                unified_api_version,
+            )
             .unwrap_or_else(|_| panic!("no adapter for network {}", self.name));
 
         let firehose_endpoint = self.firehose_endpoints.random()?;
@@ -365,11 +379,13 @@ impl FirehoseMapperTrait<Chain> for FirehoseMapper {
                 ))
             }
 
-            ForkStep::StepIrreversible => {
-                panic!("irreversible step is not handled and should not be requested in the Firehose request")
+            ForkStep::StepFinal => {
+                panic!(
+                    "final step is not handled and should not be requested in the Firehose request"
+                )
             }
 
-            ForkStep::StepUnknown => {
+            ForkStep::StepUnset => {
                 panic!("unknown step should not happen in the Firehose response")
             }
         }

@@ -1,9 +1,10 @@
-mod cache;
+mod entity_cache;
 mod err;
 mod traits;
 
-pub use cache::{CachedEthereumCall, EntityCache, ModificationsAndCache};
+pub use entity_cache::{EntityCache, ModificationsAndCache};
 
+use diesel::types::{FromSql, ToSql};
 pub use err::StoreError;
 use itertools::Itertools;
 pub use traits::*;
@@ -12,15 +13,16 @@ use futures::stream::poll_fn;
 use futures::{Async, Poll, Stream};
 use graphql_parser::schema as s;
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fmt;
 use std::fmt::Display;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use std::{fmt, io};
 
-use crate::blockchain::{Block, Blockchain};
+use crate::blockchain::Block;
 use crate::data::store::scalar::Bytes;
 use crate::data::store::*;
 use crate::data::value::Word;
@@ -71,6 +73,12 @@ impl<'a> From<&s::InterfaceType<'a, String>> for EntityType {
     }
 }
 
+impl Borrow<str> for EntityType {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 // This conversion should only be used in tests since it makes it too
 // easy to convert random strings into entity types
 #[cfg(debug_assertions)]
@@ -81,6 +89,22 @@ impl From<&str> for EntityType {
 }
 
 impl CheapClone for EntityType {}
+
+impl FromSql<diesel::sql_types::Text, diesel::pg::Pg> for EntityType {
+    fn from_sql(bytes: Option<&[u8]>) -> diesel::deserialize::Result<Self> {
+        let s = <String as FromSql<_, diesel::pg::Pg>>::from_sql(bytes)?;
+        Ok(EntityType::new(s))
+    }
+}
+
+impl ToSql<diesel::sql_types::Text, diesel::pg::Pg> for EntityType {
+    fn to_sql<W: io::Write>(
+        &self,
+        out: &mut diesel::serialize::Output<W, diesel::pg::Pg>,
+    ) -> diesel::serialize::Result {
+        <str as ToSql<diesel::sql_types::Text, diesel::pg::Pg>>::to_sql(self.0.as_str(), out)
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityFilterDerivative(bool);
@@ -104,13 +128,23 @@ pub struct EntityKey {
 
     /// ID of the individual entity.
     pub entity_id: Word,
+
+    /// This is the causality region of the data source that created the entity.
+    ///
+    /// In the case of an entity lookup, this is the causality region of the data source that is
+    /// doing the lookup. So if the entity exists but was created on a different causality region,
+    /// the lookup will return empty.
+    pub causality_region: CausalityRegion,
 }
 
 impl EntityKey {
-    pub fn data(entity_type: String, entity_id: String) -> Self {
+    // For use in tests only
+    #[cfg(debug_assertions)]
+    pub fn data(entity_type: impl Into<String>, entity_id: impl Into<String>) -> Self {
         Self {
-            entity_type: EntityType::new(entity_type),
-            entity_id: entity_id.into(),
+            entity_type: EntityType::new(entity_type.into()),
+            entity_id: entity_id.into().into(),
+            causality_region: CausalityRegion::ONCHAIN,
         }
     }
 }
@@ -246,6 +280,24 @@ impl EntityFilter {
     }
 }
 
+/// Holds the information needed to query a store.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EntityOrderByChildInfo {
+    /// The attribute of the child entity that is used to order the results.
+    pub sort_by_attribute: Attribute,
+    /// The attribute that is used to join to the parent and child entity.
+    pub join_attribute: Attribute,
+    /// If true, the child entity is derived from the parent entity.
+    pub derived: bool,
+}
+
+/// Holds the information needed to order the results of a query based on nested entities.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EntityOrderByChild {
+    Object(EntityOrderByChildInfo, EntityType),
+    Interface(EntityOrderByChildInfo, Vec<EntityType>),
+}
+
 /// The order in which entities should be restored from a store.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EntityOrder {
@@ -253,6 +305,10 @@ pub enum EntityOrder {
     Ascending(String, ValueType),
     /// Order descending by the given attribute. Use `id` as a tie-breaker
     Descending(String, ValueType),
+    /// Order ascending by the given attribute of a child entity. Use `id` as a tie-breaker
+    ChildAscending(EntityOrderByChild),
+    /// Order descending by the given attribute of a child entity. Use `id` as a tie-breaker
+    ChildDescending(EntityOrderByChild),
     /// Order by the `id` of the entities
     Default,
     /// Do not order at all. This speeds up queries where we know that
@@ -435,6 +491,8 @@ pub struct EntityQuery {
 
     pub query_id: Option<String>,
 
+    pub trace: bool,
+
     _force_use_of_new: (),
 }
 
@@ -453,6 +511,7 @@ impl EntityQuery {
             range: EntityRange::first(100),
             logger: None,
             query_id: None,
+            trace: false,
             _force_use_of_new: (),
         }
     }
@@ -1068,10 +1127,7 @@ impl ReadStore for EmptyStore {
         Ok(None)
     }
 
-    fn get_many(
-        &self,
-        _ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
-    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
+    fn get_many(&self, _: BTreeSet<EntityKey>) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
         Ok(BTreeMap::new())
     }
 
@@ -1111,4 +1167,21 @@ pub trait PruneReporter: Send + 'static {
     fn finish_switch(&mut self) {}
 
     fn finish_prune(&mut self) {}
+}
+
+/// Represents an item retrieved from an
+/// [`EthereumCallCache`](super::EthereumCallCache) implementor.
+pub struct CachedEthereumCall {
+    /// The BLAKE3 hash that uniquely represents this cache item. The way this
+    /// hash is constructed is an implementation detail.
+    pub blake3_id: Vec<u8>,
+
+    /// Block details related to this Ethereum call.
+    pub block_ptr: BlockPtr,
+
+    /// The address to the called contract.
+    pub contract_address: ethabi::Address,
+
+    /// The encoded return value of this call.
+    pub return_value: Vec<u8>,
 }

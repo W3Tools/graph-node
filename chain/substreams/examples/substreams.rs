@@ -1,6 +1,7 @@
 use anyhow::{format_err, Context, Error};
 use graph::blockchain::block_stream::BlockStreamEvent;
 use graph::blockchain::substreams_block_stream::SubstreamsBlockStream;
+use graph::firehose::SubgraphLimit;
 use graph::prelude::{info, tokio, DeploymentHash, Registry};
 use graph::tokio_stream::StreamExt;
 use graph::{env::env_var, firehose::FirehoseEndpoint, log::logger, substreams};
@@ -16,7 +17,7 @@ async fn main() -> Result<(), Error> {
 
     let token_env = env_var("SUBSTREAMS_API_TOKEN", "".to_string());
     let mut token: Option<String> = None;
-    if token_env.len() > 0 {
+    if !token_env.is_empty() {
         token = Some(token_env);
     }
 
@@ -26,7 +27,7 @@ async fn main() -> Result<(), Error> {
     );
 
     let package_file = env_var("SUBSTREAMS_PACKAGE", "".to_string());
-    if package_file == "" {
+    if package_file.is_empty() {
         panic!("Environment variable SUBSTREAMS_PACKAGE must be set");
     }
 
@@ -46,6 +47,7 @@ async fn main() -> Result<(), Error> {
         token,
         false,
         false,
+        SubgraphLimit::Unlimited,
     ));
 
     let mut stream: SubstreamsBlockStream<graph_chain_substreams::Chain> =
